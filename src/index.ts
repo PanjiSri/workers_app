@@ -1,65 +1,228 @@
 import { DurableObject } from "cloudflare:workers";
+export class BookCatalogDO extends DurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.initializeDB();
+  }
 
-/**
- * Welcome to Cloudflare Workers! This is your first Durable Objects application.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your Durable Object in action
- * - Run `npm run deploy` to publish your application
- *
- * Bind resources to your worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/durable-objects
- */
+  private initializeDB() {
+    try {
+      this.ctx.storage.sql.exec(`
+        CREATE TABLE IF NOT EXISTS books (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          title TEXT NOT NULL,
+          author TEXT NOT NULL
+        )
+      `);
+    } catch (error) {
+      console.error("Error initializing database:", error);
+    }
+  }
 
-/** A Durable Object's behavior is defined in an exported Javascript class */
-export class MyDurableObject extends DurableObject<Env> {
-	/**
-	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
-	 * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
-	 *
-	 * @param ctx - The interface for interacting with Durable Object state
-	 * @param env - The interface to reference bindings declared in wrangler.jsonc
-	 */
-	constructor(ctx: DurableObjectState, env: Env) {
-		super(ctx, env);
-	}
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const pathSegments = url.pathname.split('/').filter(Boolean);
+    
+    if (pathSegments.includes('books')) {
+      const bookId = pathSegments[pathSegments.indexOf('books') + 1];
+      
+      if (!bookId) {
+        switch (request.method) {
+          case 'GET':
+            return this.getAllBooks();
+          case 'POST':
+            return this.createBook(request);
+          default:
+            return new Response('Method not allowed', { status: 405 });
+        }
+      } 
 
-	/**
-	 * The Durable Object exposes an RPC method sayHello which will be invoked when when a Durable
-	 *  Object instance receives a request from a Worker via the same method invocation on the stub
-	 *
-	 * @param name - The name provided to a Durable Object instance from a Worker
-	 * @returns The greeting to be sent back to the Worker
-	 */
-	async sayHello(name: string): Promise<string> {
-		return `Hello, ${name}!`;
-	}
+      else {
+        const id = parseInt(bookId, 10);
+        if (isNaN(id)) {
+          return new Response('Invalid book ID', { status: 400 });
+        }
+        
+        switch (request.method) {
+          case 'GET':
+            return this.getBookById(id);
+          case 'PUT':
+            return this.updateBook(id, request);
+          case 'DELETE':
+            return this.deleteBook(id);
+          default:
+            return new Response('Method not allowed', { status: 405 });
+        }
+      }
+    }
+    
+    return new Response('Not found', { status: 404 });
+  }
+
+  async getAllBooks(): Promise<Response> {
+    try {
+      const result = this.ctx.storage.sql.exec(`
+        SELECT id, title, author FROM books
+      `);
+      
+      const books = result.toArray();
+      return new Response(JSON.stringify(books), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    } catch (error) {
+      console.error("Error fetching books:", error);
+      return new Response(JSON.stringify({ error: "Failed to fetch books" }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  }
+
+  async getBookById(id: number): Promise<Response> {
+    try {
+      const result = this.ctx.storage.sql.exec(`
+        SELECT id, title, author FROM books WHERE id = ?
+      `, id);
+      
+      const books = result.toArray();
+      if (books.length === 0) {
+        return new Response(JSON.stringify({ error: "Book not found" }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      
+      return new Response(JSON.stringify(books[0]), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    } catch (error) {
+      console.error("Error fetching book:", error);
+      return new Response(JSON.stringify({ error: "Failed to fetch book" }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  }
+
+  async createBook(request: Request): Promise<Response> {
+    try {
+      const book = await request.json() as Book;
+      
+      if (!book.title || !book.author) {
+        return new Response(JSON.stringify({ error: "Title and author are required" }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      
+      this.ctx.storage.sql.exec(
+        `INSERT INTO books (title, author) VALUES (?, ?)`,
+        book.title, book.author
+      );
+      
+      const result = this.ctx.storage.sql.exec(
+        `SELECT last_insert_rowid() as id`
+      );
+      
+      const id = result.one().id;
+      return new Response(JSON.stringify({ ...book, id }), {
+        status: 201,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    } catch (error) {
+      console.error("Error creating book:", error);
+      return new Response(JSON.stringify({ error: "Failed to create book" }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  }
+
+  async updateBook(id: number, request: Request): Promise<Response> {
+    try {
+      const checkResult = this.ctx.storage.sql.exec(`
+        SELECT id FROM books WHERE id = ?
+      `, id);
+      
+      if (checkResult.toArray().length === 0) {
+        return new Response(JSON.stringify({ error: "Book not found" }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      
+      const book = await request.json() as Book;
+      
+      this.ctx.storage.sql.exec(
+        `UPDATE books SET title = ?, author = ? WHERE id = ?`,
+        book.title, book.author, id
+      );
+      
+      const result = this.ctx.storage.sql.exec(`
+        SELECT id, title, author FROM books WHERE id = ?
+      `, id);
+      
+      return new Response(JSON.stringify(result.one()), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    } catch (error) {
+      console.error("Error updating book:", error);
+      return new Response(JSON.stringify({ error: "Failed to update book" }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  }
+
+  async deleteBook(id: number): Promise<Response> {
+    try {
+      const getResult = this.ctx.storage.sql.exec(`
+        SELECT id, title, author FROM books WHERE id = ?
+      `, id);
+      
+      const books = getResult.toArray();
+      if (books.length === 0) {
+        return new Response(JSON.stringify({ error: "Book not found" }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      
+      this.ctx.storage.sql.exec(`
+        DELETE FROM books WHERE id = ?
+      `, id);
+      
+      return new Response(JSON.stringify(books[0]), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    } catch (error) {
+      console.error("Error deleting book:", error);
+      return new Response(JSON.stringify({ error: "Failed to delete book" }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  }
 }
 
 export default {
-	/**
-	 * This is the standard fetch handler for a Cloudflare Worker
-	 *
-	 * @param request - The request submitted to the Worker from the client
-	 * @param env - The interface to reference bindings declared in wrangler.jsonc
-	 * @param ctx - The execution context of the Worker
-	 * @returns The response to be sent back to the client
-	 */
-	async fetch(request, env, ctx): Promise<Response> {
-		// We will create a `DurableObjectId` using the pathname from the Worker request
-		// This id refers to a unique instance of our 'MyDurableObject' class above
-		let id: DurableObjectId = env.MY_DURABLE_OBJECT.idFromName(new URL(request.url).pathname);
-
-		// This stub creates a communication channel with the Durable Object instance
-		// The Durable Object constructor will be invoked upon the first call for a given id
-		let stub = env.MY_DURABLE_OBJECT.get(id);
-
-		// We call the `sayHello()` RPC method on the stub to invoke the method on the remote
-		// Durable Object instance
-		let greeting = await stub.sayHello("world");
-
-		return new Response(greeting);
-	},
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+    
+    if (url.pathname === '/') {
+      return Response.redirect(`${url.origin}/view`, 301);
+    }
+    
+    if (url.pathname === '/view') {
+      return env.ASSETS.fetch(request);
+    }
+    
+    if (url.pathname.startsWith('/api/books')) {
+      const id = env.BOOK_CATALOG.idFromName('default');
+      const stub = env.BOOK_CATALOG.get(id);
+      return stub.fetch(request);
+    }
+    
+    return env.ASSETS.fetch(request);
+  }
 } satisfies ExportedHandler<Env>;
