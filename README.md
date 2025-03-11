@@ -12,4 +12,14 @@ How to Run :
     
     ex : ``` npx wrangler dev --port 9000 ```
 
- 
+Project Structure
+
+```
+./
+├── public/
+│   └── index.html       
+├── src/
+│   └── index.ts       
+├── worker-configuration.d.ts
+└── wrangler.jsonc
+```
